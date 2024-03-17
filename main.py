@@ -18,8 +18,8 @@ TODO
 CATALOG_NAME = 'iceberg'
 OUTPUT_DATABASE_NAME = 'ndelnano'
 OUTPUT_TABLE_NAME = 'athena_attribution'
+FULL_TABLE_NAME = f"{CATALOG_NAME}.{OUTPUT_DATABASE_NAME}.{OUTPUT_TABLE_NAME}"
 WAREHOUSE = 's3://ndn-data-lake'
-spark.conf.set("spark.sql.catalog.iceberg.warehouse", WAREHOUSE)
 
 
 def get_query_execution(queryId):
@@ -58,6 +58,12 @@ def get_query_execution(queryId):
         DataScannedCostUSD=(response['QueryExecution']['Statistics']['DataScannedInBytes'] / bytes_in_a_tb) * 5,
     )
 
+
+def extract_dbt_model(querytxt):
+    matches = re.search(r'"node_id"\s*:\s*"([^"]+)"', querytxt)
+    return matches.group(1) if matches else None
+
+
 def table_exists(catalog, database, table):
     spark.sql(f"USE {catalog}")
     spark.sql(f"USE {database}")
@@ -73,8 +79,9 @@ session = boto3.Session(
 )
 
 spark = SparkSession.builder.appName("AthenaCloudtrail").getOrCreate()
+spark.conf.set("spark.sql.catalog.iceberg.warehouse", WAREHOUSE)
 
-udf_schema = StructType([
+get_query_execution_udf_schema = StructType([
     StructField("QueryExecutionId", StringType()),
     StructField("QueryTxt", StringType()),
     StructField("Database", StringType()),
@@ -95,7 +102,7 @@ udf_schema = StructType([
     StructField("DataScannedCostUSD", FloatType()),
 ])
 
-registered_udf = spark.udf.register("get_query_execution", get_query_execution, udf_schema)
+get_query_execution_udf = spark.udf.register("get_query_execution", get_query_execution, get_query_execution_udf_schema)
 
 # df = spark.read.json("/home/iceberg/notebooks/notebooks/many_events.json")
 # queryIds = df.select(F.explode("Records").alias("record")).select("record.responseElements.queryExecutionId").distinct()
@@ -111,8 +118,9 @@ cloudtrail_df = spark.createDataFrame([
 # Parse IAM entity from ARN
 cloudtrail_df = cloudtrail_df.withColumn("iam", F.split(cloudtrail_df["UserIdentityArn"], ":").getItem(5))
 
-df_udf_output = cloudtrail_df.withColumn("output", registered_udf("QueryExecutionId"))
+# Parse dbt model name if exists
 
+df_udf_output = cloudtrail_df.withColumn("output", get_query_execution_udf("QueryExecutionId"))
 df_final = df_udf_output.select(
     df_udf_output.QueryExecutionId.alias("query_execution_id"),
     df_udf_output.AccountId.alias("account_id"),
@@ -137,19 +145,17 @@ df_final = df_udf_output.select(
     df_udf_output.output.DataScannedCostUSD.alias("data_scanned_cost_USD"),
 )
 
-full_table_name = f"{CATALOG_NAME}.{OUTPUT_DATABASE_NAME}.{OUTPUT_TABLE_NAME}"
-
 df_final.show()
 
 # Create the table if exists. Else MERGE.
 # In Spark 3.3+ use spark.catalog.tableExists
 if not table_exists(CATALOG_NAME, OUTPUT_DATABASE_NAME, OUTPUT_TABLE_NAME):
-    df_final.writeTo(full_table_name).partitionedBy(F.days("submission_time")).create()
+    df_final.writeTo(FULL_TABLE_NAME).partitionedBy(F.days("submission_time")).create()
 else:
     df_final.createOrReplaceTempView("df_final")
 
     merge_query = f"""
-    MERGE INTO {full_table_name} t
+    MERGE INTO {FULL_TABLE_NAME} t
     USING df_final s
     ON t.query_execution_id = s.query_execution_id
     WHEN NOT MATCHED THEN INSERT *
