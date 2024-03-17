@@ -1,5 +1,5 @@
 import boto3
-
+import re
 from pyspark.sql import SparkSession
 from pyspark.sql import Row
 from pyspark.sql.functions import col, struct, udf
@@ -19,7 +19,6 @@ CATALOG_NAME = 'iceberg'
 OUTPUT_DATABASE_NAME = 'ndelnano'
 OUTPUT_TABLE_NAME = 'athena_attribution'
 FULL_TABLE_NAME = f"{CATALOG_NAME}.{OUTPUT_DATABASE_NAME}.{OUTPUT_TABLE_NAME}"
-WAREHOUSE = 's3://ndn-data-lake'
 
 
 def get_query_execution(queryId):
@@ -98,11 +97,12 @@ get_query_execution_udf_schema = StructType([
     StructField("Workgroup", StringType()),
     StructField("SelectedEngineVersion", StringType()),
     StructField("EffectiveEngineVersion", StringType()),
-    StructField("DataScannedInTB", IntegerType()),
+    StructField("DataScannedInTB", IntType()),
     StructField("DataScannedCostUSD", FloatType()),
 ])
 
 get_query_execution_udf = spark.udf.register("get_query_execution", get_query_execution, get_query_execution_udf_schema)
+extract_dbt_model_udf = udf(extract_dbt_model, StringType())
 
 # df = spark.read.json("/home/iceberg/notebooks/notebooks/many_events.json")
 # queryIds = df.select(F.explode("Records").alias("record")).select("record.responseElements.queryExecutionId").distinct()
@@ -117,8 +117,6 @@ cloudtrail_df = spark.createDataFrame([
 
 # Parse IAM entity from ARN
 cloudtrail_df = cloudtrail_df.withColumn("iam", F.split(cloudtrail_df["UserIdentityArn"], ":").getItem(5))
-
-# Parse dbt model name if exists
 
 df_udf_output = cloudtrail_df.withColumn("output", get_query_execution_udf("QueryExecutionId"))
 df_final = df_udf_output.select(
@@ -144,6 +142,9 @@ df_final = df_udf_output.select(
     df_udf_output.output.DataScannedInTB.alias("data_scanned_in_tb"),
     df_udf_output.output.DataScannedCostUSD.alias("data_scanned_cost_USD"),
 )
+
+# Parse dbt model name if exists
+df_final = df_final.withColumn("dbt_model", extract_dbt_model_udf(df_final["query_text"]))
 
 df_final.show()
 
