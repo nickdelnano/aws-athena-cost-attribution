@@ -10,7 +10,7 @@ import pyspark.sql.functions as F
 """
 TODO
 * Cloudtrail is at least once, account for this. MERGE needs 1 row per pk.
-* Parse dbt-athena query comment
+* If a field is missing do not fail - e.g. planning time
 * Include updates for State=Failed. They can be retried. Need to adjust MERGE condition, WHEN MATCHED AND t.state='FAILED' AND s.state='SUCCEEDED' THEN UPDATE SET *
 * Add Error fields https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/athena/client/get_query_execution.html
 """
@@ -19,6 +19,7 @@ CATALOG_NAME = 'iceberg'
 OUTPUT_DATABASE_NAME = 'ndelnano'
 OUTPUT_TABLE_NAME = 'athena_attribution'
 FULL_TABLE_NAME = f"{CATALOG_NAME}.{OUTPUT_DATABASE_NAME}.{OUTPUT_TABLE_NAME}"
+WAREHOUSE = "s3://ndn-data-lake"
 
 
 def get_query_execution(queryId):
@@ -34,7 +35,7 @@ def get_query_execution(queryId):
     if state in ['QUEUED', 'RUNNING']:
         return
 
-    bytes_in_a_tb = 1000000000000
+    bytes_in_a_tb = 1000000000000.0
 
     return Row(
         QueryExecutionId=response['QueryExecution']['QueryExecutionId'],
@@ -43,12 +44,12 @@ def get_query_execution(queryId):
         State=state,
         SubmissionTime=response['QueryExecution']['Status']['SubmissionDateTime'].replace(tzinfo=None),
         CompletionDateTime=response['QueryExecution']['Status']['CompletionDateTime'].replace(tzinfo=None),
-        EngineExecutionTimeInMillis=response['QueryExecution']['Statistics']['EngineExecutionTimeInMillis'],
+        EngineExecutionTimeSeconds=response['QueryExecution']['Statistics']['EngineExecutionTimeInMillis'] / 1000.0,
         DataScannedInBytes=response['QueryExecution']['Statistics']['DataScannedInBytes'],
-        TotalExecutionTimeInMillis=response['QueryExecution']['Statistics']['TotalExecutionTimeInMillis'],
-        QueryQueueTimeInMillis=response['QueryExecution']['Statistics']['QueryQueueTimeInMillis'],
-        QueryPlanningTimeInMillis=response['QueryExecution']['Statistics']['QueryPlanningTimeInMillis'],
-        ServiceProcessingTimeInMillis=response['QueryExecution']['Statistics']['ServiceProcessingTimeInMillis'],
+        TotalExecutionTimeSeconds=response['QueryExecution']['Statistics']['TotalExecutionTimeInMillis'] / 1000.0,
+        QueryQueueTimeSeconds=response['QueryExecution']['Statistics']['QueryQueueTimeInMillis'] / 1000.0,
+        QueryPlanningTimeSeconds=response['QueryExecution']['Statistics']['QueryPlanningTimeInMillis'] / 1000.0,
+        ServiceProcessingTimeSeconds=response['QueryExecution']['Statistics']['ServiceProcessingTimeInMillis'] / 1000.0,
         ReusedPreviousResult=response['QueryExecution']['Statistics']['ResultReuseInformation']['ReusedPreviousResult'],
         Workgroup=response['QueryExecution']['WorkGroup'],
         SelectedEngineVersion=response['QueryExecution']['EngineVersion']['SelectedEngineVersion'],
@@ -87,17 +88,17 @@ get_query_execution_udf_schema = StructType([
     StructField("State", StringType()),
     StructField("SubmissionTime", TimestampType()),
     StructField("CompletionDateTime", TimestampType()),
-    StructField("EngineExecutionTimeInMillis", IntegerType()),
+    StructField("EngineExecutionTimeSeconds", FloatType()),
     StructField("DataScannedInBytes", LongType()),
-    StructField("TotalExecutionTimeInMillis", IntegerType()),
-    StructField("QueryQueueTimeInMillis", IntegerType()),
-    StructField("QueryPlanningTimeInMillis", IntegerType()),
-    StructField("ServiceProcessingTimeInMillis", IntegerType()),
+    StructField("TotalExecutionTimeSeconds", FloatType()),
+    StructField("QueryQueueTimeSeconds", IntegerType()),
+    StructField("QueryPlanningTimeSeconds", IntegerType()),
+    StructField("ServiceProcessingTimeSeconds", IntegerType()),
     StructField("ReusedPreviousResult", BooleanType()),
     StructField("Workgroup", StringType()),
     StructField("SelectedEngineVersion", StringType()),
     StructField("EffectiveEngineVersion", StringType()),
-    StructField("DataScannedInTB", IntType()),
+    StructField("DataScannedInTB", FloatType()),
     StructField("DataScannedCostUSD", FloatType()),
 ])
 
@@ -119,28 +120,30 @@ cloudtrail_df = spark.createDataFrame([
 cloudtrail_df = cloudtrail_df.withColumn("iam", F.split(cloudtrail_df["UserIdentityArn"], ":").getItem(5))
 
 df_udf_output = cloudtrail_df.withColumn("output", get_query_execution_udf("QueryExecutionId"))
+
+# Order columns by the interest to users
 df_final = df_udf_output.select(
     df_udf_output.QueryExecutionId.alias("query_execution_id"),
-    df_udf_output.AccountId.alias("account_id"),
     df_udf_output.iam.alias("iam"),
-    df_udf_output.UserIdentityArn.alias("iam_arn"),
     df_udf_output.output.QueryTxt.alias("query_text"),
-    df_udf_output.output.Database.alias("database"),
     df_udf_output.output.State.alias("state"),
-    df_udf_output.output.SubmissionTime.alias("submission_time"),
-    df_udf_output.output.CompletionDateTime.alias("completion_date_time"),
-    df_udf_output.output.EngineExecutionTimeInMillis.alias("engine_execution_time_in_millis"),
-    df_udf_output.output.DataScannedInBytes.alias("data_scanned_in__Bytes"),
-    df_udf_output.output.TotalExecutionTimeInMillis.alias("total_execution_time_in_millis"),
-    df_udf_output.output.QueryQueueTimeInMillis.alias("query_queue_time_in_millis"),
-    df_udf_output.output.QueryPlanningTimeInMillis.alias("query_planning_time_in_millis"),
-    df_udf_output.output.ServiceProcessingTimeInMillis.alias("service_processing_time_in_millis"),
-    df_udf_output.output.ReusedPreviousResult.alias("reused_previous_result"),
-    df_udf_output.output.Workgroup.alias("workgroup"),
-    df_udf_output.output.SelectedEngineVersion.alias("selected_engine_version"),
-    df_udf_output.output.EffectiveEngineVersion.alias("effective_engine_version"),
     df_udf_output.output.DataScannedInTB.alias("data_scanned_in_tb"),
     df_udf_output.output.DataScannedCostUSD.alias("data_scanned_cost_USD"),
+    df_udf_output.output.SubmissionTime.alias("submission_time"),
+    df_udf_output.output.CompletionDateTime.alias("completion_date_time"),
+    df_udf_output.output.EngineExecutionTimeSeconds.alias("engine_execution_time_seconds"),
+    df_udf_output.UserIdentityArn.alias("iam_arn"),
+    df_udf_output.output.TotalExecutionTimeSeconds.alias("total_execution_time_seconds"),
+    df_udf_output.output.QueryQueueTimeSeconds.alias("query_queue_time_seconds"),
+    df_udf_output.output.QueryPlanningTimeSeconds.alias("query_planning_time_seconds"),
+    df_udf_output.output.ServiceProcessingTimeSeconds.alias("service_processing_time_seconds"),
+    df_udf_output.output.DataScannedInBytes.alias("data_scanned_in_bytes"),
+    df_udf_output.output.Workgroup.alias("workgroup"),
+    df_udf_output.output.Database.alias("database"),
+    df_udf_output.AccountId.alias("account_id"),
+    df_udf_output.output.ReusedPreviousResult.alias("reused_previous_result"),
+    df_udf_output.output.SelectedEngineVersion.alias("selected_engine_version"),
+    df_udf_output.output.EffectiveEngineVersion.alias("effective_engine_version"),
 )
 
 # Parse dbt model name if exists
