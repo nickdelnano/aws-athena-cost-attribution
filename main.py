@@ -22,37 +22,47 @@ FULL_TABLE_NAME = f"{CATALOG_NAME}.{OUTPUT_DATABASE_NAME}.{OUTPUT_TABLE_NAME}"
 WAREHOUSE = "s3://ndn-data-lake"
 
 
-def get_query_execution(queryId):
-    client = session.client("athena")
-    response = client.get_query_execution(
-        QueryExecutionId=queryId
+def get_query_execution(query_id):
+    try:
+        client = session.client("athena")
+        response = client.get_query_execution(
+            QueryExecutionId=query_id
+        )
+
+        state = response['QueryExecution']['Status']['State']
+
+        # Only process queries that are completed
+        # Include FAILED as these can still consume cost
+        if state in ['QUEUED', 'RUNNING']:
+            return
+
+        bytes_in_a_tb = 1000000000000.0
+
+        return Row(
+            QueryExecutionId=response['QueryExecution']['QueryExecutionId'],
+            QueryTxt=response['QueryExecution']['Query'],
+            Database=response['QueryExecution']['QueryExecutionContext']['Database'],
+            State=state,
+            SubmissionTime=response['QueryExecution']['Status']['SubmissionDateTime'].replace(tzinfo=None),
+            CompletionDateTime=response['QueryExecution']['Status']['CompletionDateTime'].replace(tzinfo=None),
+            EngineExecutionTimeSeconds=response['QueryExecution']['Statistics']['EngineExecutionTimeInMillis'] / 1000.0,
+            DataScannedInBytes=response['QueryExecution']['Statistics']['DataScannedInBytes'],
+            ReusedPreviousResult=response['QueryExecution']['Statistics']['ResultReuseInformation']['ReusedPreviousResult'],
+            Workgroup=response['QueryExecution']['WorkGroup'],
+            SelectedEngineVersion=response['QueryExecution']['EngineVersion']['SelectedEngineVersion'],
+            EffectiveEngineVersion=response['QueryExecution']['EngineVersion']['EffectiveEngineVersion'],
+            DataScannedInTB=response['QueryExecution']['Statistics']['DataScannedInBytes'] / bytes_in_a_tb,
+            DataScannedCostUSD=(response['QueryExecution']['Statistics']['DataScannedInBytes'] / bytes_in_a_tb) * 5,
     )
+    except Exception as e:
+        error_handler(e, query_id)
 
-    state = response['QueryExecution']['Status']['State']
 
-    # Only process queries that are completed
-    # Include FAILED as these can still consume cost
-    if state in ['QUEUED', 'RUNNING']:
-        return
-
-    bytes_in_a_tb = 1000000000000.0
-
-    return Row(
-        QueryExecutionId=response['QueryExecution']['QueryExecutionId'],
-        QueryTxt=response['QueryExecution']['Query'],
-        Database=response['QueryExecution']['QueryExecutionContext']['Database'],
-        State=state,
-        SubmissionTime=response['QueryExecution']['Status']['SubmissionDateTime'].replace(tzinfo=None),
-        CompletionDateTime=response['QueryExecution']['Status']['CompletionDateTime'].replace(tzinfo=None),
-        EngineExecutionTimeSeconds=response['QueryExecution']['Statistics']['EngineExecutionTimeInMillis'] / 1000.0,
-        DataScannedInBytes=response['QueryExecution']['Statistics']['DataScannedInBytes'],
-        ReusedPreviousResult=response['QueryExecution']['Statistics']['ResultReuseInformation']['ReusedPreviousResult'],
-        Workgroup=response['QueryExecution']['WorkGroup'],
-        SelectedEngineVersion=response['QueryExecution']['EngineVersion']['SelectedEngineVersion'],
-        EffectiveEngineVersion=response['QueryExecution']['EngineVersion']['EffectiveEngineVersion'],
-        DataScannedInTB=response['QueryExecution']['Statistics']['DataScannedInBytes'] / bytes_in_a_tb,
-        DataScannedCostUSD=(response['QueryExecution']['Statistics']['DataScannedInBytes'] / bytes_in_a_tb) * 5,
-    )
+def error_handler(exception, query_id):
+    """
+    Record failed query IDs
+    """
+    pass
 
 
 def extract_dbt_model(querytxt):
@@ -98,7 +108,7 @@ get_query_execution_udf = spark.udf.register("get_query_execution", get_query_ex
 extract_dbt_model_udf = udf(extract_dbt_model, StringType())
 
 # df = spark.read.json("/home/iceberg/notebooks/notebooks/many_events.json")
-# queryIds = df.select(F.explode("Records").alias("record")).select("record.responseElements.queryExecutionId").distinct()
+# query_ids = df.select(F.explode("Records").alias("record")).select("record.responseElements.queryExecutionId").distinct()
 
 cloudtrail_df = spark.createDataFrame([
     Row(
